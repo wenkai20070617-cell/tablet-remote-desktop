@@ -1,0 +1,7 @@
+aiohttp==3.10.11
+mss==10.1.0
+Pillow==11.0.0
+PyAutoGUI==0.9.54
+pyperclip==1.9.0
+soundcard==0.4.4
+numpy==2.1.3
