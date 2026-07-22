@@ -1,22 +1,10 @@
 $ErrorActionPreference = "Stop"
-$ProgressPreference = "SilentlyContinue"
-
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Tools = Join-Path $Root "tools"
-$Cloudflared = Join-Path $Tools "cloudflared.exe"
-
-New-Item -ItemType Directory -Force -Path $Tools | Out-Null
-
-if (-not (Test-Path -LiteralPath $Cloudflared)) {
-  $Url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-  Write-Host "Downloading cloudflared..."
-  Invoke-WebRequest -Uri $Url -OutFile $Cloudflared
+$Local = Join-Path $Root "tools\cloudflared.exe"
+$Command = if (Test-Path -LiteralPath $Local) { $Local } else { (Get-Command cloudflared -ErrorAction SilentlyContinue).Source }
+if (-not $Command) {
+  throw "cloudflared is not installed. Download it free from https://developers.cloudflare.com/tunnel/downloads/ and place it on PATH or in tools\."
 }
-
-Write-Host ""
-Write-Host "Starting Cloudflare Quick Tunnel for http://127.0.0.1:18765"
-Write-Host "Keep this window open while using the tablet."
-Write-Host "Use the https://...trycloudflare.com URL printed below."
-Write-Host ""
-
-& $Cloudflared tunnel --url "http://127.0.0.1:18765"
+Write-Host "Starting a free best-effort Quick Tunnel for http://127.0.0.1:18765"
+Write-Host "Keep this window open. Quick Tunnel has no uptime guarantee."
+& $Command tunnel --url "http://127.0.0.1:18765"

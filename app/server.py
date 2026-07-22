@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import hmac
@@ -5,130 +7,146 @@ import io
 import json
 import os
 import secrets
+import sys
 import threading
 import time
+from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 from aiohttp import web
 from PIL import Image
 
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.config import CONFIG_PATH, hash_password, load_config
+from app.platform_support import runtime_capabilities
+from app.security import (
+    LoginLimiter,
+    SessionCapacityError,
+    SessionStore,
+    effective_scheme,
+    forwarded_client_ip,
+    host_allowed,
+    is_loopback_address,
+    origin_matches,
+)
+from app.validation import (
+    ValidationError,
+    validate_client_message,
+    validate_clipboard_payload,
+    validate_password_payload,
+)
+from app.webrtc import WEBRTC_AVAILABLE, create_peer_answer, parse_control_message
+from app.wayland_portal import WaylandPortalError, get_wayland_portal, is_wayland_session
+
 try:
     import mss
-    import pyautogui
     import pyperclip
-except Exception as exc:  # pragma: no cover
+    pyautogui = None
+    if not is_wayland_session():
+        import pyautogui
+except Exception as exc:  # pragma: no cover - depends on the host desktop
     raise RuntimeError(
-        "Missing desktop control dependencies. Run start.ps1 to install requirements."
+        "Missing desktop dependencies. Run the start script for this operating system."
     ) from exc
 
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = ROOT / "app" / "static"
-CONFIG_PATH = ROOT / "config.json"
+CONFIG, GENERATED_PASSWORD = load_config()
 
-DEFAULTS = {
-    "bind": "127.0.0.1",
-    "port": 18765,
-    "fps": 1,
-    "image_format": "jpeg",
-    "jpeg_quality": 58,
-    "max_width": 2560,
-    "active_fps": 15,
-    "active_jpeg_quality": 40,
-    "active_max_width": 1280,
-    "active_seconds": 1.2,
-    "settle_fps": 8,
-    "settle_jpeg_quality": 48,
-    "settle_max_width": 1600,
-    "settle_seconds": 3.5,
-    "preview_fps": 3,
-    "preview_jpeg_quality": 52,
-    "preview_max_width": 1920,
-    "preview_seconds": 8.0,
-    "change_detection_enabled": True,
-    "change_thumbnail_width": 96,
-    "change_thumbnail_height": 60,
-    "unchanged_preview_interval": 2.0,
-    "unchanged_full_interval": 6.0,
-    "frame_send_timeout_seconds": 2.5,
-    "session_ttl_seconds": 3600,
-    "audio_enabled": True,
-    "audio_sample_rate": 24000,
-    "audio_frames": 1024,
-}
+if pyautogui is not None:
+    pyautogui.FAILSAFE = False
+    pyautogui.PAUSE = 0
 
-pyautogui.FAILSAFE = False
-pyautogui.PAUSE = 0
+CONNECTION_STATES: dict[str, dict[str, Any]] = {}
+SESSION_WEBSOCKETS: dict[str, set[web.WebSocketResponse]] = defaultdict(set)
+PEER_CONNECTIONS: dict[str, dict[str, Any]] = {}
 
 
-def _hash_password(password: str, salt: str) -> str:
-    digest = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), bytes.fromhex(salt), 250_000
-    )
-    return digest.hex()
+def forget_session_state(token: str) -> None:
+    CONNECTION_STATES.pop(token, None)
 
 
-def load_config() -> dict:
-    cfg = dict(DEFAULTS)
-    if CONFIG_PATH.exists():
-        cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
-        return cfg
-
-    password = secrets.token_urlsafe(14)
-    salt = secrets.token_hex(16)
-    cfg.update(
-        {
-            "password_salt": salt,
-            "password_hash": _hash_password(password, salt),
-        }
-    )
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    print("")
-    print("Local remote desktop password:")
-    print(password)
-    print("")
-    print("This password is shown only on first config creation.")
-    print("")
-    return cfg
-
-
-CONFIG = load_config()
-SESSIONS: dict[str, float] = {}
-CONNECTION_STATES: dict[str, dict] = {}
+SESSION_STORE = SessionStore(
+    idle_ttl=int(CONFIG["session_idle_ttl_seconds"]),
+    absolute_ttl=int(CONFIG["session_absolute_ttl_seconds"]),
+    max_sessions=int(CONFIG["max_sessions"]),
+    max_connections=int(CONFIG["max_connections_per_session"]),
+    on_remove=forget_session_state,
+)
+LOGIN_LIMITER = LoginLimiter(
+    attempts=max(1, int(CONFIG["login_attempts"])),
+    window=max(1, int(CONFIG["login_window_seconds"])),
+    lockout=max(1, int(CONFIG["login_lockout_seconds"])),
+)
+PASSWORD_VERIFY_SEMAPHORE = asyncio.Semaphore(2)
+PASSWORD_VERIFY_PENDING = 0
+MAX_PASSWORD_VERIFY_PENDING = 4
+INPUT_LOCK = asyncio.Lock()
+WAYLAND_PORTAL = get_wayland_portal()
 GLOBAL_INTERACTION_STATE = {"last_interaction_at": 0.0}
 _CAPTURE_LOCAL = threading.local()
 
 
 def verify_password(password: str) -> bool:
-    expected = CONFIG["password_hash"]
-    actual = _hash_password(password, CONFIG["password_salt"])
+    expected = str(CONFIG["password_hash"])
+    actual = hash_password(password, str(CONFIG["password_salt"]))
     return hmac.compare_digest(expected, actual)
 
 
 def make_session() -> str:
-    token = secrets.token_urlsafe(32)
-    SESSIONS[token] = time.time() + int(CONFIG["session_ttl_seconds"])
-    return token
+    return SESSION_STORE.create()
 
 
 def get_session(request: web.Request) -> str | None:
     token = request.cookies.get("rd_session")
-    if not token:
+    record = SESSION_STORE.get(token)
+    if record is None:
+        if token:
+            CONNECTION_STATES.pop(token, None)
         return None
-    expires = SESSIONS.get(token)
-    if not expires or expires < time.time():
-        SESSIONS.pop(token, None)
-        CONNECTION_STATES.pop(token, None)
-        return None
-    SESSIONS[token] = time.time() + int(CONFIG["session_ttl_seconds"])
-    return token
+    return record.token
 
 
 def require_session(request: web.Request) -> str:
     token = get_session(request)
     if not token:
-        raise web.HTTPUnauthorized()
+        raise web.HTTPUnauthorized(text="authentication required")
     return token
+
+
+def transport_peer(request: web.Request) -> str:
+    peer = request.transport.get_extra_info("peername") if request.transport else None
+    return str(peer[0]) if isinstance(peer, tuple) and peer else "unknown"
+
+
+def request_peer(request: web.Request) -> str:
+    return forwarded_client_ip(
+        transport_peer(request),
+        request.headers.get("CF-Connecting-IP"),
+        request.headers.get("X-Forwarded-For"),
+    )
+
+
+def request_scheme(request: web.Request) -> str:
+    return effective_scheme(
+        request.scheme,
+        request.headers.get("X-Forwarded-Proto"),
+        transport_peer(request),
+    )
+
+
+def connection_input_state(display_state: dict) -> dict:
+    return {
+        "last_interaction_at": 0.0,
+        "viewport_width": int(display_state.get("viewport_width", 0) or 0),
+        "touch_id_map": {},
+        "touch_points": {},
+        "buttons_down": set(),
+    }
 
 
 def session_state(token: str) -> dict:
@@ -180,60 +198,111 @@ async def index(request: web.Request) -> web.FileResponse:
 
 
 async def login(request: web.Request) -> web.Response:
-    data = await request.json()
-    if not verify_password(str(data.get("password", ""))):
-        await asyncio.sleep(0.3)
+    global PASSWORD_VERIFY_PENDING
+    identity = request_peer(request)
+    retry_after = LOGIN_LIMITER.retry_after(identity)
+    if retry_after:
+        raise web.HTTPTooManyRequests(
+            text="too many login attempts", headers={"Retry-After": str(retry_after)}
+        )
+    try:
+        data = await request.json()
+        password = validate_password_payload(data)
+    except (json.JSONDecodeError, ValidationError, web.HTTPBadRequest) as exc:
+        raise web.HTTPBadRequest(text="invalid login request") from exc
+
+    if PASSWORD_VERIFY_PENDING >= MAX_PASSWORD_VERIFY_PENDING:
+        raise web.HTTPTooManyRequests(text="password verification queue is full", headers={"Retry-After": "1"})
+    PASSWORD_VERIFY_PENDING += 1
+    try:
+        async with PASSWORD_VERIFY_SEMAPHORE:
+            retry_after = LOGIN_LIMITER.retry_after(identity)
+            if retry_after:
+                raise web.HTTPTooManyRequests(
+                    text="too many login attempts", headers={"Retry-After": str(retry_after)}
+                )
+            valid = await asyncio.to_thread(verify_password, password)
+    finally:
+        PASSWORD_VERIFY_PENDING -= 1
+    if not valid:
+        retry_after = LOGIN_LIMITER.failure(identity)
+        await asyncio.sleep(0.25)
+        if retry_after:
+            raise web.HTTPTooManyRequests(
+                text="too many login attempts", headers={"Retry-After": str(retry_after)}
+            )
         raise web.HTTPUnauthorized(text="bad password")
 
-    token = make_session()
-    resp = web.json_response({"ok": True})
-    resp.set_cookie(
+    LOGIN_LIMITER.success(identity)
+    try:
+        token = make_session()
+    except SessionCapacityError as exc:
+        raise web.HTTPTooManyRequests(text="all session slots are active", headers={"Retry-After": "15"}) from exc
+    max_age = int(CONFIG["session_idle_ttl_seconds"])
+    response = web.json_response({"ok": True})
+    response.set_cookie(
         "rd_session",
         token,
         httponly=True,
+        secure=request_scheme(request) == "https",
         samesite="Strict",
-        max_age=int(CONFIG["session_ttl_seconds"]),
+        max_age=max_age,
+        path="/",
     )
-    return resp
+    return response
 
 
 async def logout(request: web.Request) -> web.Response:
-    token = request.cookies.get("rd_session")
-    if token:
-        SESSIONS.pop(token, None)
-        CONNECTION_STATES.pop(token, None)
-    resp = web.json_response({"ok": True})
-    resp.del_cookie("rd_session")
-    return resp
+    token = require_session(request)
+    SESSION_STORE.revoke(token)
+    CONNECTION_STATES.pop(token, None)
+    await close_session_connections(token)
+    response = web.json_response({"ok": True})
+    response.del_cookie("rd_session", path="/")
+    return response
 
 
 async def status(request: web.Request) -> web.Response:
-    logged_in = bool(get_session(request))
-    return web.json_response(
-        {
-            "authenticated": logged_in,
-            "audio": bool(CONFIG.get("audio_enabled")),
-            "clipboard": True,
-            "fileTransfer": False,
-            "multiMonitor": False,
-        }
+    authenticated = bool(get_session(request))
+    if not authenticated:
+        return web.json_response({"authenticated": False})
+    capabilities = runtime_capabilities()
+    if WAYLAND_PORTAL is not None:
+        capabilities["waylandAuthorized"] = WAYLAND_PORTAL.active
+        if WAYLAND_PORTAL.active:
+            capabilities.update(screen=True, pointer=True, keyboard=True, nativeTouch=True)
+            capabilities.setdefault("permission", {})["remoteDesktopPortal"] = True
+    capabilities.update(
+        authenticated=True,
+        audio=bool(CONFIG.get("audio_enabled")),
+        webrtc=bool(CONFIG.get("webrtc_enabled")) and WEBRTC_AVAILABLE,
+        websocket=True,
+        clipboard=True,
+        fileTransfer=False,
+        multiMonitor=False,
     )
+    return web.json_response(capabilities)
 
 
 async def clipboard_get(request: web.Request) -> web.Response:
     require_session(request)
     try:
-        text = await asyncio.to_thread(pyperclip.paste)
+        value = await asyncio.to_thread(pyperclip.paste)
     except Exception as exc:
-        raise web.HTTPInternalServerError(text=str(exc)) from exc
-    return web.json_response({"text": text})
+        raise web.HTTPServiceUnavailable(text="clipboard unavailable") from exc
+    return web.json_response({"text": str(value)[:1_000_000]})
 
 
 async def clipboard_set(request: web.Request) -> web.Response:
     require_session(request)
-    data = await request.json()
-    text = str(data.get("text", ""))
-    await asyncio.to_thread(pyperclip.copy, text)
+    try:
+        text = validate_clipboard_payload(await request.json())
+    except (json.JSONDecodeError, ValidationError, web.HTTPBadRequest) as exc:
+        raise web.HTTPBadRequest(text="invalid clipboard request") from exc
+    try:
+        await asyncio.to_thread(pyperclip.copy, text)
+    except Exception as exc:
+        raise web.HTTPServiceUnavailable(text="clipboard unavailable") from exc
     return web.json_response({"ok": True})
 
 
@@ -248,6 +317,23 @@ def screen_capture() -> mss.mss:
         sct = mss.mss()
         _CAPTURE_LOCAL.sct = sct
     return sct
+
+
+def capture_webrtc_image(state: dict) -> Image.Image:
+    if WAYLAND_PORTAL is not None:
+        image = WAYLAND_PORTAL.capture_image()
+        monitor = WAYLAND_PORTAL.monitor()
+    else:
+        with mss.mss() as capture:
+            monitor = dict(capture.monitors[1])
+            raw = capture.grab(monitor)
+        image = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+    state["monitor"] = monitor
+    target_width = frame_width(state, int(CONFIG.get("active_max_width", 1280)))
+    if image.width > target_width:
+        target_height = max(1, int(image.height * (target_width / image.width)))
+        image = image.resize((target_width, target_height), Image.Resampling.BILINEAR)
+    return image
 
 
 def frame_profile(state: dict) -> dict:
@@ -332,8 +418,12 @@ def unchanged_frame_interval(profile_name: str) -> float:
 
 
 def encode_frame(monitor: dict, profile: dict) -> tuple[dict, bytes]:
-    raw = screen_capture().grab(monitor)
-    img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+    if WAYLAND_PORTAL is not None:
+        img = WAYLAND_PORTAL.capture_image()
+        monitor = WAYLAND_PORTAL.monitor()
+    else:
+        raw = screen_capture().grab(monitor)
+        img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
     max_width = int(profile["max_width"])
     if img.width > max_width:
         height = int(img.height * (max_width / img.width))
@@ -364,8 +454,14 @@ def encode_frame(monitor: dict, profile: dict) -> tuple[dict, bytes]:
 
 
 async def screen_loop(ws: web.WebSocketResponse, state: dict) -> None:
-    with mss.mss() as sct:
-        monitor = sct.monitors[1]
+    if WAYLAND_PORTAL is not None:
+        if not WAYLAND_PORTAL.active:
+            await ws.send_json({"type": "error", "message": "Wayland permission is required"})
+            return
+        monitor = WAYLAND_PORTAL.monitor()
+    else:
+        with mss.mss() as sct:
+            monitor = dict(sct.monitors[1])
     state["monitor"] = monitor
     last_signature = None
     last_sent_at = 0.0
@@ -405,7 +501,7 @@ async def screen_loop(ws: web.WebSocketResponse, state: dict) -> None:
             if ws.closed:
                 break
             try:
-                await ws.send_json({"type": "error", "message": f"screen: {exc}"})
+                await ws.send_json({"type": "error", "message": "screen capture unavailable"})
             except ConnectionError:
                 break
             await asyncio.sleep(1)
@@ -427,7 +523,21 @@ _TOUCH_DEVICE = None
 
 
 def inject_touch_contacts(state: dict, contacts: list[dict]) -> None:
-    if os.name != "nt" or not contacts:
+    if not contacts:
+        return
+    if os.name != "nt":
+        contact = contacts[0]
+        x, y = to_screen_point(state, float(contact["x"]), float(contact["y"]))
+        contact_state = str(contact["state"])
+        pyautogui.moveTo(x, y)
+        if contact_state == "down" and not state.get("generic_touch_down"):
+            pyautogui.mouseDown(button="left")
+            state["generic_touch_down"] = True
+            state.setdefault("buttons_down", set()).add("left")
+        elif contact_state in {"up", "cancel"} and state.get("generic_touch_down"):
+            pyautogui.mouseUp(button="left")
+            state["generic_touch_down"] = False
+            state.setdefault("buttons_down", set()).discard("left")
         return
 
     import ctypes
@@ -608,7 +718,13 @@ def send_unicode_text(text: str) -> None:
     if not text:
         return
     if os.name != "nt":
-        pyautogui.write(text)
+        try:
+            previous = pyperclip.paste()
+            pyperclip.copy(text)
+            pyautogui.hotkey("command" if sys.platform == "darwin" else "ctrl", "v")
+            pyperclip.copy(previous)
+        except Exception:
+            pyautogui.write(text)
         return
 
     import ctypes
@@ -749,6 +865,8 @@ def handle_input_event(state: dict, event: dict) -> None:
         modifiers = []
         if event.get("ctrl"):
             modifiers.append("ctrl")
+        if event.get("meta"):
+            modifiers.append("command" if sys.platform == "darwin" else "win")
         if event.get("alt"):
             modifiers.append("alt")
         if event.get("shift"):
@@ -831,7 +949,7 @@ async def audio_loop(ws: web.WebSocketResponse) -> None:
         import numpy as np
         import soundcard as sc
     except Exception as exc:
-        await ws.send_json({"type": "audio_status", "ok": False, "message": str(exc)})
+        await ws.send_json({"type": "audio_status", "ok": False, "message": "system audio unavailable"})
         return
 
     try:
@@ -841,7 +959,9 @@ async def audio_loop(ws: web.WebSocketResponse) -> None:
             for mic in microphones
             if "loopback" in repr(mic).lower() or "loopback" in mic.name.lower()
         ]
-        mic = loopbacks[0] if loopbacks else microphones[0]
+        if not loopbacks:
+            raise RuntimeError("No system-audio loopback device is available")
+        mic = loopbacks[0]
         sample_rate = int(CONFIG["audio_sample_rate"])
         frames = int(CONFIG["audio_frames"])
         await ws.send_json(
@@ -858,109 +978,428 @@ async def audio_loop(ws: web.WebSocketResponse) -> None:
                 data = await asyncio.to_thread(recorder.record, frames)
                 pcm = np.clip(data, -1.0, 1.0)
                 pcm = (pcm * 32767).astype(np.int16)
-                await ws.send_bytes(
-                    pack_binary_message(
-                        {"type": "audio", "sampleRate": sample_rate, "channels": 2},
-                        pcm.tobytes(),
-                    )
+                await asyncio.wait_for(
+                    ws.send_bytes(
+                        pack_binary_message(
+                            {"type": "audio", "sampleRate": sample_rate, "channels": 2},
+                            pcm.tobytes(),
+                        )
+                    ),
+                    timeout=float(CONFIG.get("frame_send_timeout_seconds", 2.5)),
                 )
     except Exception as exc:
-        await ws.send_json({"type": "audio_status", "ok": False, "message": str(exc)})
+        await ws.send_json({"type": "audio_status", "ok": False, "message": "system audio unavailable"})
+
+
+def consume_event_budget(state: dict, rate: float = 300.0, burst: float = 600.0) -> bool:
+    now = time.monotonic()
+    bucket = state.setdefault("event_budget", {"tokens": burst, "at": now})
+    elapsed = max(0.0, now - float(bucket["at"]))
+    bucket["tokens"] = min(burst, float(bucket["tokens"]) + elapsed * rate)
+    bucket["at"] = now
+    if bucket["tokens"] < 1:
+        return False
+    bucket["tokens"] -= 1
+    return True
+
+
+async def _handle_validated_message(state: dict, event: dict, display_state: dict | None = None) -> None:
+    if event["type"] == "client_info":
+        target = display_state if display_state is not None else state
+        target["viewport_width"] = max(640, int(event["viewportWidth"] or 640))
+    elif event["type"] == "input":
+        if not consume_event_budget(state):
+            raise ValidationError("input rate exceeded")
+        async with INPUT_LOCK:
+            if WAYLAND_PORTAL is not None:
+                mark_interaction(state)
+                await WAYLAND_PORTAL.handle_input(event)
+            else:
+                await asyncio.to_thread(handle_input_event, state, event)
+    elif event["type"] == "clipboard_set":
+        await asyncio.to_thread(pyperclip.copy, event["text"])
+
+
+async def session_watchdog(token: str, ws: web.WebSocketResponse) -> None:
+    while not ws.closed:
+        await asyncio.sleep(15)
+        if SESSION_STORE.get(token, touch=False) is None:
+            await ws.close(code=1008, message=b"session expired")
+            return
+
+
+def unregister_websocket(token: str, ws: web.WebSocketResponse) -> None:
+    sockets = SESSION_WEBSOCKETS.get(token)
+    if sockets is None:
+        return
+    sockets.discard(ws)
+    if not sockets:
+        SESSION_WEBSOCKETS.pop(token, None)
+
+
+async def close_session_connections(token: str) -> None:
+    sockets = list(SESSION_WEBSOCKETS.pop(token, set()))
+    if sockets:
+        await asyncio.gather(
+            *(ws.close(code=1008, message=b"session revoked") for ws in sockets),
+            return_exceptions=True,
+        )
+    peers = [
+        (peer_id, entry) for peer_id, entry in list(PEER_CONNECTIONS.items())
+        if entry.get("token") == token
+    ]
+    for peer_id, entry in peers:
+        PEER_CONNECTIONS.pop(peer_id, None)
+        tasks = entry.get("tasks", [])
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await release_connection_input(entry["input_state"])
+        await entry["pc"].close()
+
+
+async def release_connection_input(state: dict) -> None:
+    if WAYLAND_PORTAL is not None:
+        await WAYLAND_PORTAL.release_input()
+    else:
+        await asyncio.to_thread(release_input_state, state)
 
 
 async def websocket(request: web.Request) -> web.WebSocketResponse:
     token = require_session(request)
-    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=8 * 1024 * 1024)
-    await ws.prepare(request)
-
-    state = session_state(token)
-    tasks = [
-        asyncio.create_task(screen_loop(ws, state)),
-        asyncio.create_task(text_focus_loop(ws)),
-    ]
-    await ws.send_json({"type": "hello", "message": "connected"})
-
+    if not SESSION_STORE.acquire_connection(token):
+        raise web.HTTPTooManyRequests(text="session connection limit reached")
+    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=1_100_000, compress=False)
     try:
-        async for msg in ws:
-            if msg.type != web.WSMsgType.TEXT:
-                continue
-            try:
-                event = json.loads(msg.data)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "client_info":
-                state["viewport_width"] = max(640, min(10000, int(event.get("viewportWidth", 0))))
-            elif event.get("type") == "input":
-                await asyncio.to_thread(handle_input_event, state, event)
-            elif event.get("type") == "clipboard_set":
-                await asyncio.to_thread(pyperclip.copy, str(event.get("text", "")))
+        await ws.prepare(request)
+        SESSION_WEBSOCKETS[token].add(ws)
+        state = session_state(token)
+        input_state = connection_input_state(state)
+        tasks = [
+            asyncio.create_task(screen_loop(ws, state)),
+            asyncio.create_task(text_focus_loop(ws)),
+            asyncio.create_task(session_watchdog(token, ws)),
+        ]
+        await ws.send_json(
+            {
+                "type": "hello",
+                "message": "connected",
+                "protocolVersion": 2,
+                "mediaTransports": ["webrtc", "websocket"] if WEBRTC_AVAILABLE else ["websocket"],
+            }
+        )
+        try:
+            async for message in ws:
+                if message.type != web.WSMsgType.TEXT:
+                    continue
+                try:
+                    event = validate_client_message(json.loads(message.data))
+                    if SESSION_STORE.get(token) is None:
+                        await ws.close(code=1008, message=b"session expired")
+                        break
+                    await _handle_validated_message(input_state, event, state)
+                except (json.JSONDecodeError, ValidationError, TypeError, ValueError):
+                    await ws.close(code=1008, message=b"invalid control message")
+                    break
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await release_connection_input(input_state)
+        return ws
     finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-    return ws
+        unregister_websocket(token, ws)
+        SESSION_STORE.release_connection(token)
 
 
 async def input_websocket(request: web.Request) -> web.WebSocketResponse:
     token = require_session(request)
-    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=512 * 1024)
-    await ws.prepare(request)
-
-    state = session_state(token)
-    await ws.send_json({"type": "hello", "message": "input connected"})
-
+    if not SESSION_STORE.acquire_connection(token):
+        raise web.HTTPTooManyRequests(text="session connection limit reached")
+    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=1_100_000, compress=False)
     try:
-        async for msg in ws:
-            if msg.type != web.WSMsgType.TEXT:
-                continue
-            try:
-                event = json.loads(msg.data)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "input":
-                await asyncio.to_thread(handle_input_event, state, event)
-                if event.get("ack"):
-                    await ws.send_json({"type": "ack", "profile": frame_profile(state)["name"]})
-            elif event.get("type") == "clipboard_set":
-                await asyncio.to_thread(pyperclip.copy, str(event.get("text", "")))
+        await ws.prepare(request)
+        SESSION_WEBSOCKETS[token].add(ws)
+        state = session_state(token)
+        input_state = connection_input_state(state)
+        tasks = [
+            asyncio.create_task(session_watchdog(token, ws)),
+            asyncio.create_task(text_focus_loop(ws)),
+        ]
+        await ws.send_json({"type": "hello", "message": "input connected"})
+        try:
+            async for message in ws:
+                if message.type != web.WSMsgType.TEXT:
+                    continue
+                try:
+                    event = validate_client_message(json.loads(message.data))
+                    if SESSION_STORE.get(token) is None:
+                        await ws.close(code=1008, message=b"session expired")
+                        break
+                    await _handle_validated_message(input_state, event, state)
+                    if event["type"] == "input" and event.get("ack"):
+                        await ws.send_json({"type": "ack", "profile": frame_profile(state)["name"]})
+                except (json.JSONDecodeError, ValidationError, TypeError, ValueError):
+                    await ws.close(code=1008, message=b"invalid control message")
+                    break
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await release_connection_input(input_state)
+        return ws
     finally:
-        await asyncio.to_thread(release_input_state, state)
-    return ws
+        unregister_websocket(token, ws)
+        SESSION_STORE.release_connection(token)
 
 
 async def audio_websocket(request: web.Request) -> web.WebSocketResponse:
-    require_session(request)
-    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=4 * 1024 * 1024)
-    await ws.prepare(request)
-
-    task = asyncio.create_task(audio_loop(ws))
+    token = require_session(request)
+    if not SESSION_STORE.acquire_connection(token):
+        raise web.HTTPTooManyRequests(text="session connection limit reached")
+    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=4096, compress=False)
     try:
-        async for _ in ws:
-            pass
+        await ws.prepare(request)
+        SESSION_WEBSOCKETS[token].add(ws)
+        task = asyncio.create_task(audio_loop(ws))
+        watchdog = asyncio.create_task(session_watchdog(token, ws))
+        try:
+            async for _ in ws:
+                if SESSION_STORE.get(token) is None:
+                    await ws.close(code=1008, message=b"session expired")
+                    break
+        finally:
+            task.cancel()
+            watchdog.cancel()
+            await asyncio.gather(task, watchdog, return_exceptions=True)
+        return ws
     finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-    return ws
+        unregister_websocket(token, ws)
+        SESSION_STORE.release_connection(token)
+
+
+async def authorize_platform(request: web.Request) -> web.Response:
+    require_session(request)
+    if WAYLAND_PORTAL is None:
+        return web.json_response({"required": False, "authorized": True})
+    try:
+        await WAYLAND_PORTAL.start()
+    except WaylandPortalError as exc:
+        raise web.HTTPServiceUnavailable(text="Wayland permission was not established") from exc
+    return web.json_response(
+        {"required": True, "authorized": True, "monitor": WAYLAND_PORTAL.monitor()}
+    )
+
+
+async def webrtc_offer(request: web.Request) -> web.Response:
+    token = require_session(request)
+    if not CONFIG.get("webrtc_enabled") or not WEBRTC_AVAILABLE:
+        raise web.HTTPServiceUnavailable(text="WebRTC is unavailable")
+    if not SESSION_STORE.acquire_connection(token):
+        raise web.HTTPTooManyRequests(text="session connection limit reached")
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValidationError("offer must be an object")
+        sdp = data.get("sdp")
+        offer_type = data.get("type")
+        viewport_width = data.get("viewportWidth", 1280)
+        if not isinstance(sdp, str) or not 1 <= len(sdp) <= 200_000 or offer_type != "offer":
+            raise ValidationError("invalid WebRTC offer")
+        if isinstance(viewport_width, bool):
+            raise ValidationError("invalid viewport width")
+        viewport_width = max(640, min(10000, int(viewport_width)))
+    except (json.JSONDecodeError, ValidationError, TypeError, ValueError, web.HTTPBadRequest) as exc:
+        SESSION_STORE.release_connection(token)
+        raise web.HTTPBadRequest(text="invalid WebRTC offer") from exc
+
+    state = session_state(token)
+    state["viewport_width"] = viewport_width
+    input_state = connection_input_state(state)
+    peer_id = secrets.token_urlsafe(18)
+    control_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
+    released = False
+    input_released = False
+
+    async def release_peer_input() -> None:
+        nonlocal input_released
+        if input_released:
+            return
+        input_released = True
+        await release_connection_input(input_state)
+
+    async def control_worker() -> None:
+        while True:
+            raw = await control_queue.get()
+            if SESSION_STORE.get(token) is None:
+                return
+            try:
+                event = validate_client_message(parse_control_message(raw))
+                await _handle_validated_message(input_state, event, state)
+            except (json.JSONDecodeError, ValidationError, TypeError, ValueError):
+                continue
+
+    worker = asyncio.create_task(control_worker())
+
+    def on_control(raw: str) -> None:
+        if not isinstance(raw, str) or len(raw) > 65_536:
+            return
+        try:
+            control_queue.put_nowait(raw)
+        except asyncio.QueueFull:
+            return
+
+    def on_state_change(connection_state: str) -> None:
+        nonlocal released
+        if connection_state in {"failed", "closed"} and not released:
+            released = True
+            SESSION_STORE.release_connection(token)
+            entry = PEER_CONNECTIONS.pop(peer_id, None)
+            worker.cancel()
+            asyncio.create_task(release_peer_input())
+
+    try:
+        pc, answer = await create_peer_answer(
+            offer_sdp=sdp,
+            offer_type=offer_type,
+            capture=lambda: capture_webrtc_image(state),
+            on_control_message=on_control,
+            on_state_change=on_state_change,
+            stun_urls=[str(item) for item in CONFIG.get("stun_urls", [])],
+            fps=int(CONFIG.get("active_fps", 15)),
+            audio_enabled=bool(CONFIG.get("audio_enabled")),
+            audio_sample_rate=int(CONFIG.get("audio_sample_rate", 24000)),
+            audio_frames=int(CONFIG.get("audio_frames", 1024)),
+        )
+    except Exception as exc:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        if not released:
+            SESSION_STORE.release_connection(token)
+        await release_peer_input()
+        raise web.HTTPServiceUnavailable(text="WebRTC negotiation failed") from exc
+
+    async def peer_watchdog() -> None:
+        while pc.connectionState not in {"failed", "closed"}:
+            await asyncio.sleep(15)
+            if SESSION_STORE.get(token, touch=False) is None:
+                await pc.close()
+                return
+
+    watchdog = asyncio.create_task(peer_watchdog())
+    PEER_CONNECTIONS[peer_id] = {
+        "pc": pc,
+        "token": token,
+        "tasks": [worker, watchdog],
+        "input_state": input_state,
+    }
+    return web.json_response({**answer, "peerId": peer_id})
+
+
+@web.middleware
+async def security_middleware(request: web.Request, handler):
+    try:
+        needs_origin = request.method not in {"GET", "HEAD", "OPTIONS"} or request.path.startswith("/ws")
+        if needs_origin:
+            try:
+                host = request.host
+            except ValueError as exc:
+                raise web.HTTPBadRequest(text="invalid host") from exc
+            allowed = CONFIG.get("allowed_origins", [])
+            if not isinstance(allowed, list):
+                allowed = []
+            if not origin_matches(
+                request.headers.get("Origin"), request_scheme(request), host, [str(item) for item in allowed]
+            ):
+                raise web.HTTPForbidden(text="origin rejected")
+        try:
+            host = request.host
+        except ValueError as exc:
+            raise web.HTTPBadRequest(text="invalid host") from exc
+        allowed_hosts = CONFIG.get("allowed_hosts", [])
+        if not isinstance(allowed_hosts, list) or not host_allowed(host, [str(item) for item in allowed_hosts]):
+            raise web.HTTPBadRequest(text="host rejected")
+        response = await handler(request)
+    except web.HTTPException as exc:
+        response = exc
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
+        "img-src 'self' blob: data:; media-src 'self' blob:; "
+        "style-src 'self'; script-src 'self'; connect-src 'self' ws: wss:"
+    )
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+async def close_peer_connections(app: web.Application) -> None:
+    entries = list(PEER_CONNECTIONS.values())
+    PEER_CONNECTIONS.clear()
+    tasks = []
+    for entry in entries:
+        for task in entry.get("tasks", []):
+            task.cancel()
+            tasks.append(task)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    if entries:
+        await asyncio.gather(
+            *(release_connection_input(entry["input_state"]) for entry in entries),
+            return_exceptions=True,
+        )
+        await asyncio.gather(*(entry["pc"].close() for entry in entries), return_exceptions=True)
+    if WAYLAND_PORTAL is not None:
+        await WAYLAND_PORTAL.close()
 
 
 def build_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[security_middleware], client_max_size=1_200_000)
     app.router.add_get("/", index)
     app.router.add_post("/api/login", login)
     app.router.add_post("/api/logout", logout)
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/clipboard", clipboard_get)
     app.router.add_post("/api/clipboard", clipboard_set)
+    app.router.add_post("/api/platform/authorize", authorize_platform)
+    app.router.add_post("/api/webrtc/offer", webrtc_offer)
     app.router.add_get("/ws", websocket)
     app.router.add_get("/ws/input", input_websocket)
     app.router.add_get("/ws/audio", audio_websocket)
     app.router.add_static("/static", STATIC_DIR)
+    app.on_cleanup.append(close_peer_connections)
     return app
 
 
-if __name__ == "__main__":
-    bind = str(os.environ.get("TRD_BIND", CONFIG["bind"]))
-    port = int(os.environ.get("TRD_PORT", CONFIG["port"]))
+def main() -> None:
+    bind = str(os.environ.get("TRD_BIND", CONFIG["bind"])).strip()
+    try:
+        port = int(os.environ.get("TRD_PORT", CONFIG["port"]))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("TRD_PORT must be an integer from 1 through 65535") from exc
+    if not 1 <= port <= 65535:
+        raise RuntimeError("TRD_PORT must be an integer from 1 through 65535")
+    if not is_loopback_address(bind) and os.environ.get("TRD_ALLOW_INSECURE_LAN") != "1":
+        raise RuntimeError(
+            "Plain HTTP on a non-loopback address is disabled. Use the HTTPS tunnel, or set "
+            "TRD_ALLOW_INSECURE_LAN=1 only for a trusted local network."
+        )
+    if GENERATED_PASSWORD:
+        print()
+        print("Local remote desktop password (shown once):")
+        print(GENERATED_PASSWORD)
+        print(f"Configuration: {CONFIG_PATH}")
+        print()
     print(f"Tablet Remote Desktop listening on http://{bind}:{port}")
-    print("Close this window to stop remote control.")
+    if not is_loopback_address(bind):
+        print("WARNING: explicitly enabled non-loopback HTTP; traffic is not encrypted.")
+    print("Press Ctrl+C or close this window to stop remote control.")
     web.run_app(build_app(), host=bind, port=port)
+
+
+if __name__ == "__main__":
+    main()

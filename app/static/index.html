@@ -8,7 +8,7 @@
     />
     <meta name="theme-color" content="#090b0e" />
     <title>&#24179;&#26495;&#36828;&#25511;</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20" />
+    <link rel="stylesheet" href="/static/styles.css?v=21" />
   </head>
   <body>
     <main class="shell">
@@ -38,17 +38,21 @@
             <span id="statusDot" class="status-dot"></span>
             <strong id="connectionState">&#36830;&#25509;&#20013;</strong>
             <span id="audioState">&#22768;&#38899;&#31561;&#24453;</span>
+            <span id="transportState">WebSocket</span>
           </div>
           <div class="toolstrip" role="toolbar">
             <button id="zoomOut" type="button" class="icon-button" title="&#32553;&#23567;">&minus;</button>
             <button id="zoomReset" type="button" class="tool-button compact">100%</button>
             <button id="zoomIn" type="button" class="icon-button" title="&#25918;&#22823;">+</button>
+            <button id="pullClipboard" type="button" class="tool-button" title="Copy host clipboard">&#21462;&#21098;&#36148;&#26495;</button>
+            <button id="pushClipboard" type="button" class="tool-button" title="Send local clipboard">&#21457;&#21098;&#36148;&#26495;</button>
             <button id="fullscreen" type="button" class="tool-button">&#20840;&#23631;</button>
             <button id="logout" type="button" class="tool-button danger">&#36864;&#20986;</button>
           </div>
         </header>
 
         <div id="viewer" class="viewer" tabindex="0">
+          <video id="screenVideo" class="hidden" autoplay playsinline></video>
           <img id="screen" alt="remote screen" draggable="false" />
           <div id="emptyState" class="empty-state">&#31561;&#24453;&#30011;&#38754;</div>
         </div>
@@ -112,6 +116,6 @@
         ></textarea>
       </section>
     </main>
-    <script src="/static/app.js?v=20"></script>
+    <script src="/static/app.js?v=22"></script>
   </body>
 </html>

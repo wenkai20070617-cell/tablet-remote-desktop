@@ -1,11 +1,6 @@
-﻿$ErrorActionPreference = "Stop"
-
+$ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$VenvPython = Join-Path $Root ".venv\Scripts\python.exe"
-$Python = if (Test-Path -LiteralPath $VenvPython) {
-  $VenvPython
-} else {
-  (Get-Command python -ErrorAction Stop).Source
-}
-
-& $Python (Join-Path $Root "app\reset_password.py")
+$Python = Join-Path $Root ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $Python)) { throw "Run start.ps1 once before resetting the password." }
+Push-Location $Root
+try { & $Python -m app.reset_password } finally { Pop-Location }

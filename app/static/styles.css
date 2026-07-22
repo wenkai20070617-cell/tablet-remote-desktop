@@ -360,7 +360,8 @@ textarea:focus {
   padding: 0;
 }
 
-#screen {
+#screen,
+#screenVideo {
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
@@ -460,4 +461,15 @@ textarea:focus {
     height: 38px;
   }
 
+}
+
+
+#screenVideo.hidden,
+#screen.hidden {
+  display: none;
+}
+
+#transportState {
+  color: var(--muted);
+  font-size: 0.78rem;
 }

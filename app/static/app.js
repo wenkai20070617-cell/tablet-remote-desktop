@@ -5,10 +5,14 @@ const passwordInput = document.getElementById("password");
 const loginMessage = document.getElementById("loginMessage");
 const viewer = document.getElementById("viewer");
 const screen = document.getElementById("screen");
+const screenVideo = document.getElementById("screenVideo");
 const emptyState = document.getElementById("emptyState");
 const connectionState = document.getElementById("connectionState");
 const statusDot = document.getElementById("statusDot");
 const audioState = document.getElementById("audioState");
+const transportState = document.getElementById("transportState");
+const pullClipboard = document.getElementById("pullClipboard");
+const pushClipboard = document.getElementById("pushClipboard");
 const keyboardButton = document.getElementById("keyboardButton");
 const keyboardSink = document.getElementById("keyboardSink");
 const mouseControl = document.getElementById("mouseControl");
@@ -30,6 +34,14 @@ let audioWs = null;
 let reconnectTimer = null;
 let inputReconnectTimer = null;
 let audioReconnectTimer = null;
+let peerConnection = null;
+let rtcControl = null;
+let rtcMediaStream = null;
+let rtcFallbackTimer = null;
+let rtcConnected = false;
+let rtcVideoReady = false;
+let rtcHadAudio = false;
+let hostStatus = null;
 let shouldReconnect = true;
 let lastMoveAt = 0;
 let audioContext = null;
@@ -64,11 +76,12 @@ let lastMainMessageAt = 0;
 let frameLoadTimer = null;
 
 async function checkStatus() {
-  const res = await fetch("/api/status");
-  const status = await res.json();
-  if (status.authenticated) {
-    showRemote();
+  const res = await fetch("/api/status", { cache: "no-store" });
+  hostStatus = await res.json();
+  if (hostStatus.authenticated) {
+    await showRemote();
   }
+  return hostStatus;
 }
 
 loginForm.addEventListener("submit", async (event) => {
@@ -83,7 +96,7 @@ loginForm.addEventListener("submit", async (event) => {
     loginMessage.textContent = "\u5bc6\u7801\u9519\u8bef";
     return;
   }
-  showRemote();
+  await checkStatus();
 });
 
 document.getElementById("logout").addEventListener("click", async () => {
@@ -97,6 +110,7 @@ document.getElementById("logout").addEventListener("click", async () => {
   if (ws) ws.close();
   closeInputWebSocket();
   closeAudioWebSocket();
+  closeWebRTC();
   await fetch("/api/logout", { method: "POST" });
   loginPanel.classList.remove("hidden");
   remotePanel.classList.add("hidden");
@@ -287,13 +301,32 @@ mousePad.addEventListener("pointercancel", (event) => {
   resetMousePadState();
 });
 
-function showRemote() {
+async function authorizeHostPlatform() {
+  if (!hostStatus || hostStatus.linuxSession !== "wayland" || hostStatus.waylandAuthorized) return true;
+  setConnectionState("\u8bf7\u5728\u4e3b\u673a\u4e0a\u5141\u8bb8\u5c4f\u5e55\u4e0e\u63a7\u5236\u6743\u9650", "connecting");
+  let response;
+  try {
+    response = await fetch("/api/platform/authorize", { method: "POST" });
+  } catch (_) {
+    return false;
+  }
+  if (!response.ok) return false;
+  const result = await response.json();
+  hostStatus.waylandAuthorized = Boolean(result.authorized);
+  return hostStatus.waylandAuthorized;
+}
+
+async function showRemote() {
   shouldReconnect = true;
   loginPanel.classList.add("hidden");
   remotePanel.classList.remove("hidden");
   startFrameWatchdog();
   viewer.focus();
-  connectWebSocket();
+  if (await authorizeHostPlatform()) {
+    startPreferredTransport();
+  } else {
+    setConnectionState("\u4e3b\u673a\u672a\u6388\u6743Wayland\u8fdc\u63a7", "closed");
+  }
   requestWakeLock();
 }
 
@@ -313,7 +346,7 @@ function startFrameWatchdog() {
       lastMainMessageAt > 0 &&
       performance.now() - lastMainMessageAt > FRAME_STALL_TIMEOUT_MS
     ) {
-      setConnectionState("画面重连中", "closed");
+      setConnectionState("\u753b\u9762\u91cd\u8fde\u4e2d", "closed");
       ws.close();
     }
   }, 3000);
@@ -325,21 +358,197 @@ function stopFrameWatchdog() {
   frameWatchdogTimer = null;
 }
 
+function waitForIceGatheringComplete(connection, timeoutMs = 6000) {
+  if (connection.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const timeout = window.setTimeout(finish, timeoutMs);
+    function finish() {
+      window.clearTimeout(timeout);
+      connection.removeEventListener("icegatheringstatechange", changed);
+      resolve();
+    }
+    function changed() {
+      if (connection.iceGatheringState === "complete") finish();
+    }
+    connection.addEventListener("icegatheringstatechange", changed);
+  });
+}
+
+function setScreenTransport(mode) {
+  const usingWebRTC = mode === "webrtc";
+  rtcConnected = usingWebRTC;
+  screenVideo.classList.toggle("hidden", !usingWebRTC);
+  screen.classList.toggle("hidden", usingWebRTC);
+  transportState.textContent = usingWebRTC ? "WebRTC" : "WebSocket";
+  if (usingWebRTC) {
+    screenVideo.classList.add("ready");
+    markScreenReady();
+  }
+}
+
+function closeWebRTC() {
+  if (rtcFallbackTimer) {
+    window.clearTimeout(rtcFallbackTimer);
+    rtcFallbackTimer = null;
+  }
+  const control = rtcControl;
+  rtcControl = null;
+  const connection = peerConnection;
+  peerConnection = null;
+  if (control) {
+    try { control.close(); } catch (_) {}
+  }
+  if (connection) {
+    try { connection.close(); } catch (_) {}
+  }
+  if (rtcMediaStream) {
+    for (const track of rtcMediaStream.getTracks()) track.stop();
+  }
+  rtcMediaStream = null;
+  screenVideo.srcObject = null;
+  screenVideo.muted = false;
+  rtcConnected = false;
+  rtcVideoReady = false;
+  rtcHadAudio = false;
+}
+
+function fallbackToWebSocket(message = "WebRTC\u4e0d\u53ef\u7528\uff0c\u4f7f\u7528WebSocket") {
+  closeWebRTC();
+  setScreenTransport("websocket");
+  transportState.textContent = message;
+  connectWebSocket();
+}
+
+async function activateWebRTC(connection) {
+  if (
+    connection !== peerConnection ||
+    connection.connectionState !== "connected" ||
+    !rtcVideoReady
+  ) return;
+  try {
+    await screenVideo.play();
+  } catch (_) {
+    screenVideo.muted = true;
+    try {
+      await screenVideo.play();
+      if (rtcHadAudio) audioState.textContent = "\u70b9\u51fb\u753b\u9762\u5f00\u542f\u58f0\u97f3";
+    } catch (_) {
+      if (connection === peerConnection) fallbackToWebSocket("WebRTC\u64ad\u653e\u5931\u8d25\uff0c\u4f7f\u7528WebSocket");
+      return;
+    }
+  }
+  if (connection !== peerConnection || connection.connectionState !== "connected") return;
+  setScreenTransport("webrtc");
+  setConnectionState("\u5df2\u8fde\u63a5", "connected");
+  connectInputWebSocket();
+  if (rtcFallbackTimer) {
+    window.clearTimeout(rtcFallbackTimer);
+    rtcFallbackTimer = null;
+  }
+}
+
+async function connectWebRTC() {
+  if (!window.RTCPeerConnection || !hostStatus || !hostStatus.webrtc) {
+    fallbackToWebSocket();
+    return;
+  }
+  closeWebRTC();
+  const connection = new RTCPeerConnection({
+    iceServers: [{ urls: ["stun:stun.cloudflare.com:3478"] }],
+  });
+  peerConnection = connection;
+  rtcMediaStream = new MediaStream();
+  screenVideo.srcObject = rtcMediaStream;
+  const control = connection.createDataChannel("control", { ordered: true });
+  rtcControl = control;
+  control.addEventListener("open", () => {
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const viewportWidth = Math.round(Math.max(viewer.clientWidth, screen.clientWidth) * dpr);
+    control.send(JSON.stringify({ type: "client_info", viewportWidth }));
+  });
+  const recoverControl = () => {
+    if (connection !== peerConnection || remotePanel.classList.contains("hidden")) return;
+    connectInputWebSocket();
+  };
+  control.addEventListener("close", recoverControl);
+  control.addEventListener("error", recoverControl);
+  connection.addTransceiver("video", { direction: "recvonly" });
+  connection.addTransceiver("audio", { direction: "recvonly" });
+  connection.addEventListener("track", (event) => {
+    rtcMediaStream.addTrack(event.track);
+    if (event.track.kind === "video") {
+      rtcVideoReady = true;
+      activateWebRTC(connection);
+      event.track.addEventListener("ended", () => {
+        if (connection === peerConnection && !remotePanel.classList.contains("hidden")) {
+          fallbackToWebSocket("WebRTC\u5df2\u7ed3\u675f\uff0c\u4f7f\u7528WebSocket");
+        }
+      }, { once: true });
+    } else if (event.track.kind === "audio") {
+      rtcHadAudio = true;
+      audioState.textContent = screenVideo.muted ? "\u70b9\u51fb\u753b\u9762\u5f00\u542f\u58f0\u97f3" : "\u58f0\u97f3\u5df2\u5f00\u542f";
+    }
+  });
+  connection.addEventListener("connectionstatechange", () => {
+    if (connection !== peerConnection) return;
+    if (connection.connectionState === "connected") {
+      activateWebRTC(connection);
+    } else if (["disconnected", "failed", "closed"].includes(connection.connectionState)) {
+      if (!remotePanel.classList.contains("hidden")) fallbackToWebSocket();
+    }
+  });
+  setConnectionState("WebRTC\u8fde\u63a5\u4e2d", "connecting");
+  rtcFallbackTimer = window.setTimeout(() => fallbackToWebSocket("WebRTC\u8d85\u65f6\uff0c\u4f7f\u7528WebSocket"), 14000);
+  try {
+    await connection.setLocalDescription(await connection.createOffer());
+    await waitForIceGatheringComplete(connection);
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const viewportWidth = Math.round(Math.max(viewer.clientWidth, screen.clientWidth) * dpr);
+    const response = await fetch("/api/webrtc/offer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: connection.localDescription.type,
+        sdp: connection.localDescription.sdp,
+        viewportWidth,
+      }),
+    });
+    if (!response.ok) throw new Error("WebRTC offer rejected");
+    const answer = await response.json();
+    if (connection !== peerConnection) return;
+    await connection.setRemoteDescription({ type: answer.type, sdp: answer.sdp });
+    if (!answer.audio) audioState.textContent = "\u7cfb\u7edf\u58f0\u97f3\u4e0d\u53ef\u7528";
+  } catch (_) {
+    if (connection === peerConnection) fallbackToWebSocket();
+  }
+}
+
+function startPreferredTransport() {
+  if (hostStatus && hostStatus.webrtc) {
+    connectWebRTC();
+  } else {
+    fallbackToWebSocket();
+  }
+}
+
 function connectWebSocket() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.binaryType = "arraybuffer";
+  const socket = new WebSocket(`${proto}://${location.host}/ws`);
+  ws = socket;
+  socket.binaryType = "arraybuffer";
   setConnectionState("\u8fde\u63a5\u4e2d", "connecting");
-  ws.addEventListener("open", () => {
+  socket.addEventListener("open", () => {
+    if (ws !== socket) return;
     if (reconnectTimer) {
       window.clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
     lastMainMessageAt = performance.now();
     setConnectionState("\u5df2\u8fde\u63a5", "connected");
+    setScreenTransport("websocket");
     const dpr = Math.max(1, window.devicePixelRatio || 1);
     const viewportWidth = Math.round(Math.max(viewer.clientWidth, screen.clientWidth) * dpr);
     socket.send(JSON.stringify({ type: "client_info", viewportWidth }));
@@ -347,19 +556,21 @@ function connectWebSocket() {
     connectInputWebSocket();
     connectAudioWebSocket();
   });
-  ws.addEventListener("close", () => {
+
+  socket.addEventListener("close", () => {
+    if (ws !== socket) return;
+    ws = null;
     setConnectionState("\u5df2\u65ad\u5f00", "closed");
     closeInputWebSocket();
     closeAudioWebSocket();
-    if (!shouldReconnect || remotePanel.classList.contains("hidden")) return;
+    if (!shouldReconnect || remotePanel.classList.contains("hidden") || rtcConnected) return;
     reconnectTimer = window.setTimeout(connectWebSocket, 1200);
   });
-  ws.addEventListener("message", (event) => {
+  socket.addEventListener("message", (event) => {
+    if (ws !== socket) return;
     lastMainMessageAt = performance.now();
     handleSocketMessage(event, handleMainJsonMessage, handleMainBinaryMessage).catch(() => {
-      if (ws === socket && socket.readyState === WebSocket.OPEN) {
-        socket.close();
-      }
+      if (ws === socket && socket.readyState === WebSocket.OPEN) socket.close();
     });
   });
 }
@@ -375,6 +586,14 @@ function connectInputWebSocket() {
     if (inputReconnectTimer) {
       window.clearTimeout(inputReconnectTimer);
       inputReconnectTimer = null;
+    }
+  });
+  socket.addEventListener("message", (event) => {
+    if (inputWs !== socket || typeof event.data !== "string") return;
+    try {
+      handleMainJsonMessage(JSON.parse(event.data));
+    } catch (_) {
+      socket.close();
     }
   });
   socket.addEventListener("close", () => {
@@ -426,7 +645,8 @@ async function handleSocketMessage(event, jsonHandler, binaryHandler) {
 }
 
 function markScreenReady() {
-  screen.classList.add("ready");
+  if (rtcConnected) screenVideo.classList.add("ready");
+  else screen.classList.add("ready");
   emptyState.classList.add("hidden");
 }
 
@@ -585,6 +805,15 @@ function handleAudioBinaryMessage(meta, payload) {
 }
 
 function ensureAudio() {
+  if (rtcConnected && screenVideo.muted) {
+    screenVideo.muted = false;
+    screenVideo.play().then(() => {
+      if (rtcHadAudio) audioState.textContent = "\u58f0\u97f3\u5df2\u5f00\u542f";
+    }).catch(() => {
+      screenVideo.muted = true;
+      if (rtcHadAudio) audioState.textContent = "\u6d4f\u89c8\u5668\u963b\u6b62\u58f0\u97f3\u64ad\u653e";
+    });
+  }
   if (!audioContext) {
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if (Ctx) {
@@ -635,16 +864,18 @@ function playPcmSamples(samples, sampleRate, channels = 2) {
 function setZoom(next) {
   zoom = Math.max(0.7, Math.min(2.4, next));
   screen.style.transform = `scale(${zoom})`;
+  screenVideo.style.transform = `scale(${zoom})`;
   zoomReset.textContent = `${Math.round(zoom * 100)}%`;
 }
 
 function normalizedPoint(event) {
-  const rect = screen.getBoundingClientRect();
+  const target = rtcConnected ? screenVideo : screen;
+  const rect = target.getBoundingClientRect();
   if (rect.width < 1 || rect.height < 1) return null;
-  return {
-    x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
-    y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
-  };
+  const x = (event.clientX - rect.left) / rect.width;
+  const y = (event.clientY - rect.top) / rect.height;
+  if (x < 0 || x > 1 || y < 0 || y > 1) return null;
+  return { x, y };
 }
 
 function pointerSample(event) {
@@ -662,6 +893,10 @@ function pointerSample(event) {
 
 function sendInput(payload) {
   const message = JSON.stringify({ type: "input", ...payload });
+  if (rtcControl && rtcControl.readyState === "open") {
+    rtcControl.send(message);
+    return;
+  }
   if (inputWs && inputWs.readyState === WebSocket.OPEN) {
     inputWs.send(message);
     return;
@@ -879,9 +1114,10 @@ viewer.addEventListener(
   (event) => {
     event.preventDefault();
     const p = normalizedPoint(event);
+    if (!p) return;
     sendInput({
       kind: "wheel",
-      ...(p || {}),
+      ...p,
       delta: Math.sign(event.deltaY) * 4,
       deltaX: Math.sign(event.deltaX) * 4,
     });
@@ -900,6 +1136,7 @@ document.addEventListener("keydown", (event) => {
     ctrl: event.ctrlKey,
     alt: event.altKey,
     shift: event.shiftKey,
+    meta: event.metaKey,
   });
 });
 
@@ -921,10 +1158,64 @@ document.addEventListener("visibilitychange", () => {
   }
   lastMainMessageAt = performance.now();
   if (!remotePanel.classList.contains("hidden")) {
-    connectWebSocket();
+    if (rtcConnected) screenVideo.play().catch(() => {});
+    else connectWebSocket();
   }
 });
 
 window.addEventListener("pagehide", cancelActiveTouches);
+
+
+async function copyHostClipboard() {
+  const response = await fetch("/api/clipboard", { cache: "no-store" });
+  if (!response.ok) throw new Error("host clipboard unavailable");
+  const data = await response.json();
+  const value = data.text || "";
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error("clipboard API unavailable");
+    await navigator.clipboard.writeText(value);
+    return true;
+  } catch (_) {
+    window.prompt("\u6d4f\u89c8\u5668\u4e0d\u80fd\u76f4\u63a5\u5199\u5165\u526a\u8d34\u677f\uff0c\u8bf7\u624b\u52a8\u590d\u5236\uff1a", value);
+    return false;
+  }
+}
+
+async function sendLocalClipboard() {
+  let value;
+  try {
+    if (!navigator.clipboard?.readText) throw new Error("clipboard API unavailable");
+    value = await navigator.clipboard.readText();
+  } catch (_) {
+    value = window.prompt("\u6d4f\u89c8\u5668\u4e0d\u80fd\u76f4\u63a5\u8bfb\u53d6\u526a\u8d34\u677f\uff0c\u8bf7\u5728\u6b64\u7c98\u8d34\u540e\u53d1\u9001\uff1a", "");
+    if (value === null) throw new Error("clipboard input cancelled");
+  }
+  const response = await fetch("/api/clipboard", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: value }),
+  });
+  if (!response.ok) throw new Error("host clipboard unavailable");
+}
+
+pullClipboard.addEventListener("click", async () => {
+  try {
+    const copied = await copyHostClipboard();
+    pullClipboard.textContent = copied ? "\u5df2\u590d\u5236" : "\u8bf7\u624b\u52a8\u590d\u5236";
+  } catch (_) {
+    pullClipboard.textContent = "\u590d\u5236\u5931\u8d25";
+  }
+  window.setTimeout(() => { pullClipboard.textContent = "\u53d6\u526a\u8d34\u677f"; }, 1200);
+});
+
+pushClipboard.addEventListener("click", async () => {
+  try {
+    await sendLocalClipboard();
+    pushClipboard.textContent = "\u5df2\u53d1\u9001";
+  } catch (_) {
+    pushClipboard.textContent = "\u53d1\u9001\u5931\u8d25";
+  }
+  window.setTimeout(() => { pushClipboard.textContent = "\u53d1\u526a\u8d34\u677f"; }, 1200);
+});
 
 checkStatus().catch(() => {});
