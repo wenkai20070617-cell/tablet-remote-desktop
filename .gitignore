@@ -4,7 +4,11 @@ __pycache__/
 
 config.json
 logs/
-tools/
+tools/*
+!tools/service_runner.ps1
+
+# Temporary trees created by the test suite.
+tests/_scratch/
 
 .DS_Store
 Thumbs.db

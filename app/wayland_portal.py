@@ -109,6 +109,7 @@ class WaylandPortalSession:
         self._start_lock = asyncio.Lock()
         self._touch_slots: dict[int, int] = {}
         self._buttons_down: set[int] = set()
+        self._keys_down: set[int] = set()
 
     def _request_path(self, token: str) -> str:
         sender = str(self.bus.unique_name).lstrip(":").replace(".", "_")
@@ -213,6 +214,9 @@ class WaylandPortalSession:
         names = {"Enter":0xFF0D,"Backspace":0xFF08,"Tab":0xFF09,"Escape":0xFF1B,"Delete":0xFFFF,
                  "Insert":0xFF63,"Home":0xFF50,"End":0xFF57,"PageUp":0xFF55,"PageDown":0xFF56,
                  "ArrowLeft":0xFF51,"ArrowUp":0xFF52,"ArrowRight":0xFF53,"ArrowDown":0xFF54,
+                 " ":0x0020,"Control":0xFFE3,"Shift":0xFFE1,"Alt":0xFFE9,"Meta":0xFFEB,
+                 "CapsLock":0xFFE5,"NumLock":0xFF7F,"ScrollLock":0xFF14,"PrintScreen":0xFF61,
+                 "Pause":0xFF13,"ContextMenu":0xFF67,"Clear":0xFF0B,
                  **{f"F{i}":0xFFBD+i for i in range(1,13)}}
         if key in names: return names[key]
         if len(key) == 1:
@@ -243,10 +247,21 @@ class WaylandPortalSession:
             if event.get("delta"): await self.remote.call_notify_pointer_axis_discrete(self.session_handle, {}, 0, int(event["delta"]))
             if event.get("deltaX"): await self.remote.call_notify_pointer_axis_discrete(self.session_handle, {}, 1, int(event["deltaX"]))
         elif kind == "key":
-            modifiers = ([0xFFE3] if event.get("ctrl") else []) + ([0xFFE1] if event.get("shift") else []) + ([0xFFE9] if event.get("alt") else []) + ([0xFFEB] if event.get("meta") else [])
-            for item in modifiers: await self._key(item, True)
-            symbol = self._keysym(event["key"]); await self._key(symbol, True); await self._key(symbol, False)
-            for item in reversed(modifiers): await self._key(item, False)
+            # ``down``/``up`` hold a key so long presses and combinations work;
+            # ``press`` (the default) keeps the tap semantics.
+            action = str(event.get("action", "press"))
+            symbol = self._keysym(event["key"])
+            if action == "down":
+                await self._key(symbol, True)
+                self._keys_down.add(symbol)
+            elif action == "up":
+                await self._key(symbol, False)
+                self._keys_down.discard(symbol)
+            else:
+                modifiers = ([0xFFE3] if event.get("ctrl") else []) + ([0xFFE1] if event.get("shift") else []) + ([0xFFE9] if event.get("alt") else []) + ([0xFFEB] if event.get("meta") else [])
+                for item in modifiers: await self._key(item, True)
+                await self._key(symbol, True); await self._key(symbol, False)
+                for item in reversed(modifiers): await self._key(item, False)
         elif kind == "text":
             for character in event["text"]:
                 symbol = self._keysym(character); await self._key(symbol, True); await self._key(symbol, False)
@@ -270,6 +285,10 @@ class WaylandPortalSession:
 
     async def release_input(self) -> None:
         if not self.active: return
+        for symbol in tuple(self._keys_down):
+            try: await self._key(symbol, False)
+            except Exception: pass
+        self._keys_down.clear()
         for code in tuple(self._buttons_down):
             try: await self.remote.call_notify_pointer_button(self.session_handle, {}, code, 0)
             except Exception: pass

@@ -24,6 +24,48 @@ function Get-SafeTrackedProcess([string]$Path) {
   }
 }
 
+# A running supervisor would restart what is about to be stopped, so it goes first.
+$supervisorPidFile = Join-Path $Logs "supervisor.pid"
+$watchdogStopped = $false
+if (Test-Path -LiteralPath $supervisorPidFile) {
+  $supervisorPid = 0
+  if ([int]::TryParse((Get-Content -LiteralPath $supervisorPidFile -Raw).Trim(), [ref]$supervisorPid)) {
+    $process = Get-Process -Id $supervisorPid -ErrorAction SilentlyContinue
+    if ($process) {
+      # Confirm it is ours before terminating, so a recycled process id is safe.
+      $isOurs = $true
+      try {
+        $candidate = Get-CimInstance Win32_Process -Filter "ProcessId=$supervisorPid" -ErrorAction SilentlyContinue
+        if ($candidate -and $candidate.CommandLine -and
+            $candidate.CommandLine -notlike "*service_runner.ps1*" -and
+            $candidate.CommandLine -notlike "*watch.ps1*") {
+          $isOurs = $false
+        }
+      } catch {}
+      if ($isOurs) {
+        Stop-Process -Id $supervisorPid -Force -ErrorAction SilentlyContinue
+        $watchdogStopped = $true
+      }
+    }
+  }
+  Remove-Item -LiteralPath $supervisorPidFile -Force -ErrorAction SilentlyContinue
+}
+$watchScript = Join-Path $Root "watch.ps1"
+$runnerScript = Join-Path $Root "service_runner.ps1"
+foreach ($shellName in @("pwsh.exe", "powershell.exe")) {
+  $candidates = Get-CimInstance Win32_Process -Filter "Name='$shellName'" -ErrorAction SilentlyContinue |
+    Where-Object {
+      $_.CommandLine -and ($_.CommandLine -like "*$watchScript*" -or $_.CommandLine -like "*$runnerScript*")
+    }
+  foreach ($candidate in $candidates) {
+    Stop-Process -Id $candidate.ProcessId -Force -ErrorAction SilentlyContinue
+    $watchdogStopped = $true
+  }
+}
+if ($watchdogStopped) {
+  Write-Host "Stopped the supervisor. A scheduled task will start it again at the next logon."
+}
+
 foreach ($Name in @("server.pid", "cloudflared.pid")) {
   $PidFile = Join-Path $Logs $Name
   if (-not (Test-Path -LiteralPath $PidFile)) { continue }
@@ -33,4 +75,5 @@ foreach ($Name in @("server.pid", "cloudflared.pid")) {
   }
   Remove-Item -LiteralPath $PidFile -Force
 }
+
 Write-Host "Tablet Remote Desktop background processes stopped."

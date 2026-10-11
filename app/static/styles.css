@@ -473,3 +473,293 @@ textarea:focus {
   color: var(--muted);
   font-size: 0.78rem;
 }
+
+/* --- viewer stage, cursor overlay ------------------------------------- */
+.stage {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  min-width: 100%;
+  min-height: 100%;
+}
+
+#screen,
+#screenVideo {
+  display: block;
+}
+
+.cursor-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.remote-cursor {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform: translate(-4px, -2px);
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.55));
+  will-change: transform;
+}
+
+.remote-cursor.hidden {
+  display: none;
+}
+
+.viewer.panning {
+  cursor: grab;
+}
+
+.viewer.panning:active {
+  cursor: grabbing;
+}
+
+/* --- metrics HUD ------------------------------------------------------ */
+.metrics-hud {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.metrics-toggle {
+  width: 30px;
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--muted);
+  background: #131a22;
+}
+
+.metrics-hud.expanded .metrics-toggle {
+  color: var(--accent);
+  border-color: rgba(22, 198, 167, 0.5);
+}
+
+.metrics-grid {
+  display: none;
+  grid-template-columns: repeat(3, minmax(58px, auto));
+  gap: 4px 10px;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(8, 12, 16, 0.86);
+  font-size: 11px;
+}
+
+.metrics-hud.expanded .metrics-grid {
+  display: grid;
+}
+
+.metrics-grid div {
+  display: grid;
+  gap: 0;
+}
+
+.metrics-grid dt {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.metrics-grid dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.metrics-grid dd.warn {
+  color: var(--warn);
+}
+
+.metrics-grid dd.bad {
+  color: var(--danger);
+}
+
+/* --- file panel ------------------------------------------------------- */
+.file-panel {
+  position: fixed;
+  right: max(10px, env(safe-area-inset-right));
+  top: calc(64px + env(safe-area-inset-top));
+  width: min(360px, calc(100vw - 24px));
+  max-height: min(70dvh, 620px);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  backdrop-filter: blur(14px);
+  z-index: 6;
+}
+
+.file-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.icon-button.small {
+  width: 30px;
+  min-width: 30px;
+  min-height: 30px;
+  font-size: 18px;
+}
+
+.file-roots {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.file-roots button.active {
+  border-color: rgba(22, 198, 167, 0.7);
+  background: rgba(22, 198, 167, 0.18);
+}
+
+.file-path {
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: #0d1319;
+  color: var(--muted);
+  font-size: 12px;
+  word-break: break-all;
+  max-height: 48px;
+  overflow: auto;
+}
+
+.file-list {
+  flex: 1 1 auto;
+  min-height: 120px;
+  max-height: 34dvh;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0b1015;
+}
+
+.file-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  font-size: 13px;
+}
+
+.file-row:last-child {
+  border-bottom: 0;
+}
+
+.file-row button {
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.file-row .file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-row .file-meta {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.file-empty {
+  padding: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.file-actions {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+}
+
+.transfer-list {
+  display: grid;
+  gap: 6px;
+  max-height: 26dvh;
+  overflow: auto;
+}
+
+.transfer-item {
+  display: grid;
+  gap: 3px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 12px;
+  background: #0d1319;
+}
+
+.transfer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.transfer-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transfer-bar {
+  position: relative;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+
+.transfer-bar span {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 120ms linear;
+}
+
+.transfer-item.error .transfer-bar span {
+  background: var(--danger);
+}
+
+.transfer-item.done .transfer-bar span {
+  background: #4ade80;
+}
+
+.transfer-item button {
+  min-height: 26px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+@media (max-width: 860px) {
+  .metrics-grid {
+    grid-template-columns: repeat(3, minmax(52px, auto));
+  }
+
+  .file-panel {
+    top: auto;
+    bottom: max(10px, env(safe-area-inset-bottom));
+    max-height: 62dvh;
+  }
+}
